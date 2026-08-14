@@ -1,0 +1,6 @@
+{
+  "name": "Bank FSM Critical Infrastructure Platform",
+  "description": "Bank-Grade Critical Infrastructure Field Service Management (FSM) platform for UPS and Battery assets with Multi-Tenant RLS, PostGIS Geofencing, Transactional Outbox, S3 WORM Compliance Vault, and SLA Engine.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
