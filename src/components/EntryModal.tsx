@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { LedgerRecord, ITEM_CODE_MAPPING } from '../types/ledger';
-import { Plus, Trash2, X, Calculator } from 'lucide-react';
+import { Plus, Trash2, X, Calculator, AlertCircle } from 'lucide-react';
+import { normalizeItemCode, getCanonicalItemName } from '../utils/ledgerEngine';
 
 interface EntryItemInput {
+  id?: string;
   itemCode: string;
   itemName: string;
   qty: string;
@@ -18,15 +20,21 @@ interface EntryItemInput {
 interface EntryModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onSave: (entries: Partial<LedgerRecord>[]) => Promise<void>;
+  onSaveSingle: (id: string, entry: Partial<LedgerRecord>) => Promise<void>;
+  onSaveGroup: (slipNo: string, entries: Partial<LedgerRecord>[]) => Promise<void>;
+  onSaveNew: (entries: Partial<LedgerRecord>[]) => Promise<void>;
   editingRecord?: LedgerRecord | null;
+  editingSlipGroup?: LedgerRecord[] | null;
 }
 
 export const EntryModal: React.FC<EntryModalProps> = ({
   isOpen,
   onClose,
-  onSave,
+  onSaveSingle,
+  onSaveGroup,
+  onSaveNew,
   editingRecord,
+  editingSlipGroup,
 }) => {
   const [date, setDate] = useState<string>(new Date().toISOString().split('T')[0]);
   const [slipNo, setSlipNo] = useState<string>('');
@@ -44,14 +52,35 @@ export const EntryModal: React.FC<EntryModalProps> = ({
       remarks: '',
     },
   ]);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   useEffect(() => {
-    if (editingRecord) {
+    setErrorMessage(null);
+    if (editingSlipGroup && editingSlipGroup.length > 0) {
+      setDate(editingSlipGroup[0].date || new Date().toISOString().split('T')[0]);
+      setSlipNo(editingSlipGroup[0].slipNo || '');
+      setItems(
+        editingSlipGroup.map((r) => ({
+          id: r.id,
+          itemCode: r.itemCode || '',
+          itemName: r.itemName || '',
+          qty: r.qty ? String(r.qty) : '',
+          rate: r.rate ? String(r.rate) : '',
+          wChg: r.wChg ? String(r.wChg) : '',
+          amount: r.amount ? String(r.amount) : '',
+          payment: r.payment ? String(r.payment) : '',
+          title: r.title || '',
+          paymentDate: r.paymentDate || '',
+          remarks: r.remarks || '',
+        }))
+      );
+    } else if (editingRecord) {
       setDate(editingRecord.date || new Date().toISOString().split('T')[0]);
       setSlipNo(editingRecord.slipNo || '');
       setItems([
         {
+          id: editingRecord.id,
           itemCode: editingRecord.itemCode || '',
           itemName: editingRecord.itemName || '',
           qty: editingRecord.qty ? String(editingRecord.qty) : '',
@@ -82,7 +111,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
         },
       ]);
     }
-  }, [editingRecord, isOpen]);
+  }, [editingRecord, editingSlipGroup, isOpen]);
 
   if (!isOpen) return null;
 
@@ -92,13 +121,11 @@ export const EntryModal: React.FC<EntryModalProps> = ({
       const item = { ...updated[index], [field]: value };
 
       if (field === 'itemCode') {
-        const upperCode = value.trim().toUpperCase();
-        if (ITEM_CODE_MAPPING[upperCode]) {
-          item.itemName = ITEM_CODE_MAPPING[upperCode];
-        }
+        const normCode = normalizeItemCode(value);
+        item.itemName = getCanonicalItemName(normCode, item.itemName);
       }
 
-      // Automatically compute AMOUNT from QTY, RATE, W CHG
+      // Automatically compute AMOUNT preview from QTY, RATE, W CHG
       const qty = parseFloat(field === 'qty' ? value : item.qty) || 0;
       const rate = parseFloat(field === 'rate' ? value : item.rate) || 0;
       const wChg = parseFloat(field === 'wChg' ? value : item.wChg) || 0;
@@ -137,20 +164,24 @@ export const EntryModal: React.FC<EntryModalProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    setErrorMessage(null);
     setIsSubmitting(true);
+
     try {
       const recordsToSave: Partial<LedgerRecord>[] = items.map((item) => {
+        const normCode = normalizeItemCode(item.itemCode);
+        const mappedName = getCanonicalItemName(normCode, item.itemName);
         const qty = parseFloat(item.qty) || 0;
         const rate = parseFloat(item.rate) || 0;
         const wChg = parseFloat(item.wChg) || 0;
-        const computedAmt = qty > 0 || rate > 0 ? qty * rate + wChg : parseFloat(item.amount) || 0;
+        const computedAmt = (qty > 0 || rate > 0) ? (qty * rate) + wChg : (parseFloat(item.amount) || 0);
 
         return {
-          id: editingRecord ? editingRecord.id : undefined,
+          id: item.id,
           date,
-          slipNo,
-          itemCode: item.itemCode.trim().toUpperCase(),
-          itemName: item.itemName,
+          slipNo: slipNo.trim(),
+          itemCode: normCode,
+          itemName: mappedName,
           qty,
           rate,
           wChg,
@@ -162,10 +193,17 @@ export const EntryModal: React.FC<EntryModalProps> = ({
         };
       });
 
-      await onSave(recordsToSave);
+      if (editingSlipGroup && editingSlipGroup.length > 0) {
+        await onSaveGroup(editingSlipGroup[0].slipNo, recordsToSave);
+      } else if (editingRecord && recordsToSave.length === 1 && recordsToSave[0].id) {
+        await onSaveSingle(recordsToSave[0].id, recordsToSave[0]);
+      } else {
+        await onSaveNew(recordsToSave);
+      }
+
       onClose();
-    } catch (err) {
-      console.error(err);
+    } catch (err: any) {
+      setErrorMessage(err.message || 'An error occurred while saving.');
     } finally {
       setIsSubmitting(false);
     }
@@ -178,7 +216,11 @@ export const EntryModal: React.FC<EntryModalProps> = ({
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-900/50">
           <h2 className="text-lg font-bold text-cyan-400 flex items-center gap-2">
-            {editingRecord ? 'Edit Ledger Entry' : 'Add Ledger Entry'}
+            {editingSlipGroup
+              ? `Editing Slip [ ${editingSlipGroup[0]?.slipNo} ] (${items.length} items)`
+              : editingRecord
+              ? 'Editing Single Entry'
+              : 'Add Ledger Entry'}
           </h2>
           <button
             onClick={onClose}
@@ -187,6 +229,14 @@ export const EntryModal: React.FC<EntryModalProps> = ({
             <X className="w-5 h-5" />
           </button>
         </div>
+
+        {/* Error alert banner */}
+        {errorMessage && (
+          <div className="mx-6 mt-4 p-3 bg-rose-950/80 border border-rose-800 rounded-lg text-rose-200 text-xs flex items-center gap-2 font-sans">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{errorMessage}</span>
+          </div>
+        )}
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="flex-1 overflow-y-auto p-6 space-y-6">
@@ -234,17 +284,15 @@ export const EntryModal: React.FC<EntryModalProps> = ({
           <div className="space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold text-slate-300 uppercase tracking-wider">
-                Item & Payment Records
+                Slip Item Records
               </h3>
-              {!editingRecord && (
-                <button
-                  type="button"
-                  onClick={handleAddItemRow}
-                  className="flex items-center gap-1 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg transition"
-                >
-                  <Plus className="w-3.5 h-3.5" /> Add Another Item to Slip
-                </button>
-              )}
+              <button
+                type="button"
+                onClick={handleAddItemRow}
+                className="flex items-center gap-1 text-xs font-semibold bg-cyan-600 hover:bg-cyan-500 text-white px-3 py-1.5 rounded-lg transition"
+              >
+                <Plus className="w-3.5 h-3.5" /> Add Another Item to Slip
+              </button>
             </div>
 
             {items.map((item, index) => (
@@ -279,14 +327,19 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                   </div>
                   <div>
                     <label className="block text-[11px] font-medium text-slate-400 mb-1">
-                      Item Name (Auto-mapped)
+                      Item Name (Auto-mapped for known codes)
                     </label>
                     <input
                       type="text"
-                      placeholder="Mapped item name"
+                      placeholder="Item name"
                       value={item.itemName}
+                      readOnly={Boolean(ITEM_CODE_MAPPING[normalizeItemCode(item.itemCode)])}
                       onChange={(e) => handleItemChange(index, 'itemName', e.target.value)}
-                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-100 focus:outline-hidden focus:border-cyan-500"
+                      className={`w-full border rounded-lg px-3 py-1.5 text-sm text-slate-100 focus:outline-hidden ${
+                        ITEM_CODE_MAPPING[normalizeItemCode(item.itemCode)]
+                          ? 'bg-slate-950 border-slate-800 text-cyan-300 font-medium cursor-not-allowed'
+                          : 'bg-slate-900 border-slate-700 focus:border-cyan-500'
+                      }`}
                     />
                   </div>
                   <div>
@@ -295,7 +348,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     </label>
                     <input
                       type="text"
-                      placeholder="e.g. Supply / Payment Title"
+                      placeholder="e.g. Delivery / Payment Title"
                       value={item.title}
                       onChange={(e) => handleItemChange(index, 'title', e.target.value)}
                       className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm text-slate-100 focus:outline-hidden focus:border-cyan-500"
@@ -312,6 +365,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     <input
                       type="number"
                       step="any"
+                      min="0"
                       placeholder="0"
                       value={item.qty}
                       onChange={(e) => handleItemChange(index, 'qty', e.target.value)}
@@ -325,6 +379,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     <input
                       type="number"
                       step="any"
+                      min="0"
                       placeholder="0.00"
                       value={item.rate}
                       onChange={(e) => handleItemChange(index, 'rate', e.target.value)}
@@ -338,6 +393,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     <input
                       type="number"
                       step="any"
+                      min="0"
                       placeholder="0.00"
                       value={item.wChg}
                       onChange={(e) => handleItemChange(index, 'wChg', e.target.value)}
@@ -351,6 +407,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     <input
                       type="number"
                       step="any"
+                      min="0"
                       placeholder="0.00"
                       value={item.amount}
                       onChange={(e) => handleItemChange(index, 'amount', e.target.value)}
@@ -368,6 +425,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
                     <input
                       type="number"
                       step="any"
+                      min="0"
                       placeholder="0.00"
                       value={item.payment}
                       onChange={(e) => handleItemChange(index, 'payment', e.target.value)}
@@ -417,7 +475,7 @@ export const EntryModal: React.FC<EntryModalProps> = ({
               disabled={isSubmitting}
               className="px-5 py-2 rounded-lg text-sm font-semibold bg-cyan-600 hover:bg-cyan-500 text-white shadow-md transition disabled:opacity-50"
             >
-              {isSubmitting ? 'Saving...' : editingRecord ? 'Save Changes' : 'Add Record(s)'}
+              {isSubmitting ? 'Saving...' : editingSlipGroup ? 'Save Complete Slip' : editingRecord ? 'Save Entry' : 'Add Record(s)'}
             </button>
           </div>
 

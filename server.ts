@@ -1,7 +1,16 @@
 import express, { Request, Response } from 'express';
 import path from 'path';
-import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
+import {
+  processAndRecalculateLedger,
+  validateLedgerInput,
+  RawLedgerInput,
+} from './src/utils/ledgerEngine';
+import {
+  readRawLedgerStore,
+  saveRawLedgerStore,
+  CorruptedDatabaseError,
+} from './src/utils/ledgerStorage';
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
@@ -9,203 +18,212 @@ const PORT = Number(process.env.PORT || 3000);
 app.disable('x-powered-by');
 app.use(express.json({ limit: '10mb' }));
 
-// Item code mapping dictionary
-export const ITEM_CODE_MAP: Record<string, string> = {
-  'K/V': 'Port',
-  'P/O': 'Olien',
-  'E/TIN': 'Empty tin',
-  'CAP': 'Cap',
-  'L/S': 'Line serso',
-  'M/S': 'Mill serso',
-};
-
-export interface LedgerEntry {
-  id: string;
-  date: string;
-  slipNo: string;
-  itemCode: string;
-  itemName: string;
-  qty: number;
-  rate: number;
-  wChg: number;
-  amount: number;
-  payment: number;
-  title: string;
-  paymentDate: string;
-  remarks: string;
-  createdAt: string;
-}
-
-const DATA_DIR = path.join(process.cwd(), 'data');
-const DATA_FILE = path.join(DATA_DIR, 'ledger_store.json');
-
-// Ensure data directory exists and data file is initialized empty
-function initDatabase() {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: recursive_option() });
+// Middleware for Corrupted DB Protection Error Handling
+function handleStoreError(res: Response, err: any) {
+  if (err instanceof CorruptedDatabaseError) {
+    return res.status(500).json({
+      error: 'CORRUPTED_DATABASE',
+      message: err.message,
+      details: 'The ledger store JSON file contains invalid formatting. Operations halted to protect financial data.',
+    });
   }
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify([], null, 2), 'utf-8');
-  }
-}
-
-function recursive_option() {
-  return true;
-}
-
-function readEntries(): LedgerEntry[] {
-  initDatabase();
-  try {
-    const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-    return JSON.parse(raw);
-  } catch {
-    return [];
-  }
-}
-
-function writeEntries(entries: LedgerEntry[]) {
-  initDatabase();
-  fs.writeFileSync(DATA_FILE, JSON.stringify(entries, null, 2), 'utf-8');
-}
-
-// Compute proper item name, amount, and running balances sequentially
-export function processAndRecalculateLedger(entries: LedgerEntry[]): (LedgerEntry & { runningBalance: number })[] {
-  // Sort entries chronologically by date, then by creation timestamp
-  const sorted = [...entries].sort((a, b) => {
-    if (a.date !== b.date) {
-      return a.date.localeCompare(b.date);
-    }
-    return a.createdAt.localeCompare(b.createdAt);
-  });
-
-  let currentBalance = 0;
-  return sorted.map((entry) => {
-    // Determine mapped item name if code matches
-    const mappedName = ITEM_CODE_MAP[entry.itemCode.trim().toUpperCase()] || entry.itemName || '';
-
-    // Amount calculation: (QTY * RATE) + W CHG
-    const qty = Number(entry.qty) || 0;
-    const rate = Number(entry.rate) || 0;
-    const wChg = Number(entry.wChg) || 0;
-    const calculatedAmount = (qty > 0 || rate > 0) ? (qty * rate) + wChg : (Number(entry.amount) || 0);
-
-    const payment = Number(entry.payment) || 0;
-    currentBalance = currentBalance + calculatedAmount - payment;
-
-    return {
-      ...entry,
-      itemName: mappedName,
-      amount: calculatedAmount,
-      payment: payment,
-      runningBalance: currentBalance,
-    };
+  return res.status(500).json({
+    error: 'STORAGE_ERROR',
+    message: err.message || 'An internal database storage error occurred.',
   });
 }
 
-// API Routes
+// GET /api/ledger - Returns complete recalculated ledger
 app.get('/api/ledger', (req: Request, res: Response) => {
-  const rawEntries = readEntries();
-  const processed = processAndRecalculateLedger(rawEntries);
-  res.json(processed);
+  try {
+    const rawRecords = readRawLedgerStore();
+    const recalculated = processAndRecalculateLedger(rawRecords);
+    res.json(recalculated);
+  } catch (err) {
+    handleStoreError(res, err);
+  }
 });
 
+// GET /api/ledger/slips/:slipNo - Get all items belonging to a Slip No
+app.get('/api/ledger/slips/:slipNo', (req: Request, res: Response) => {
+  try {
+    const { slipNo } = req.params;
+    const rawRecords = readRawLedgerStore();
+    const recalculated = processAndRecalculateLedger(rawRecords);
+    const slipItems = recalculated.filter(
+      (r) => r.slipNo.toLowerCase() === slipNo.trim().toLowerCase()
+    );
+    res.json(slipItems);
+  } catch (err) {
+    handleStoreError(res, err);
+  }
+});
+
+// POST /api/ledger - Add single or multiple ledger entries
 app.post('/api/ledger', (req: Request, res: Response) => {
-  const rawEntries = readEntries();
-  const body = req.body;
-  const newItems: LedgerEntry[] = Array.isArray(body) ? body : [body];
+  try {
+    const body = req.body;
+    const itemsInput: RawLedgerInput[] = Array.isArray(body) ? body : [body];
 
-  const now = new Date().toISOString();
-  const addedEntries: LedgerEntry[] = [];
+    if (itemsInput.length === 0) {
+      return res.status(400).json({ error: 'INVALID_INPUT', message: 'At least one ledger entry is required.' });
+    }
 
-  for (const item of newItems) {
-    const itemCode = (item.itemCode || '').trim().toUpperCase();
-    const mappedName = ITEM_CODE_MAP[itemCode] || item.itemName || '';
-    const qty = Number(item.qty) || 0;
-    const rate = Number(item.rate) || 0;
-    const wChg = Number(item.wChg) || 0;
-    const amount = (qty > 0 || rate > 0) ? (qty * rate) + wChg : (Number(item.amount) || 0);
+    // Validate all items before writing
+    const allErrors: { index: number; errors: any[] }[] = [];
+    itemsInput.forEach((item, index) => {
+      const valResult = validateLedgerInput(item);
+      if (!valResult.isValid) {
+        allErrors.push({ index, errors: valResult.errors });
+      }
+    });
 
-    const newEntry: LedgerEntry = {
-      id: item.id || `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      date: item.date || new Date().toISOString().split('T')[0],
-      slipNo: item.slipNo || '',
-      itemCode: itemCode,
-      itemName: mappedName,
-      qty,
-      rate,
-      wChg,
-      amount,
-      payment: Number(item.payment) || 0,
-      title: item.title || '',
-      paymentDate: item.paymentDate || '',
-      remarks: item.remarks || '',
+    if (allErrors.length > 0) {
+      return res.status(400).json({
+        error: 'VALIDATION_FAILED',
+        message: 'Invalid entry input provided.',
+        validationErrors: allErrors,
+      });
+    }
+
+    const rawRecords = readRawLedgerStore();
+    const now = new Date().toISOString();
+
+    const newEntries: RawLedgerInput[] = itemsInput.map((item, idx) => ({
+      ...item,
+      id: item.id || `rec_${Date.now()}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
+      createdAt: item.createdAt || new Date(Date.now() + idx).toISOString(),
+    }));
+
+    const updatedRaw = [...rawRecords, ...newEntries];
+    saveRawLedgerStore(updatedRaw);
+
+    const recalculated = processAndRecalculateLedger(updatedRaw);
+    res.status(201).json({ success: true, count: newEntries.length, data: recalculated });
+  } catch (err) {
+    handleStoreError(res, err);
+  }
+});
+
+// PUT /api/ledger/slips/:slipNo - Bulk update complete slip group
+app.put('/api/ledger/slips/:slipNo', (req: Request, res: Response) => {
+  try {
+    const targetSlipNo = req.params.slipNo.trim();
+    const body = req.body;
+    const updatedSlipItems: RawLedgerInput[] = Array.isArray(body) ? body : [body];
+
+    if (updatedSlipItems.length === 0) {
+      return res.status(400).json({ error: 'INVALID_INPUT', message: 'Slip payload cannot be empty.' });
+    }
+
+    // Validate items
+    const allErrors: { index: number; errors: any[] }[] = [];
+    updatedSlipItems.forEach((item, index) => {
+      const valResult = validateLedgerInput(item);
+      if (!valResult.isValid) {
+        allErrors.push({ index, errors: valResult.errors });
+      }
+    });
+
+    if (allErrors.length > 0) {
+      return res.status(400).json({
+        error: 'VALIDATION_FAILED',
+        message: 'Validation failed on updated slip entries.',
+        validationErrors: allErrors,
+      });
+    }
+
+    const rawRecords = readRawLedgerStore();
+    // Remove all existing records belonging to this slip
+    const nonSlipRecords = rawRecords.filter(
+      (r) => (r.slipNo || '').trim().toLowerCase() !== targetSlipNo.toLowerCase()
+    );
+
+    const now = new Date().toISOString();
+    const newSlipEntries: RawLedgerInput[] = updatedSlipItems.map((item, idx) => ({
+      ...item,
+      slipNo: item.slipNo || targetSlipNo,
+      id: item.id || `rec_${Date.now()}_${idx}_${Math.random().toString(36).substring(2, 6)}`,
       createdAt: item.createdAt || now,
-    };
-    addedEntries.push(newEntry);
+    }));
+
+    const updatedRaw = [...nonSlipRecords, ...newSlipEntries];
+    saveRawLedgerStore(updatedRaw);
+
+    const recalculated = processAndRecalculateLedger(updatedRaw);
+    res.json({ success: true, count: newSlipEntries.length, data: recalculated });
+  } catch (err) {
+    handleStoreError(res, err);
   }
-
-  const updatedRaw = [...rawEntries, ...addedEntries];
-  writeEntries(updatedRaw);
-
-  const processed = processAndRecalculateLedger(updatedRaw);
-  res.status(201).json({ success: true, count: addedEntries.length, data: processed });
 });
 
+// PUT /api/ledger/:id - Update single entry
 app.put('/api/ledger/:id', (req: Request, res: Response) => {
-  const { id } = req.params;
-  const rawEntries = readEntries();
-  const index = rawEntries.findIndex((e) => e.id === id);
+  try {
+    const { id } = req.params;
+    const rawRecords = readRawLedgerStore();
+    const index = rawRecords.findIndex((e) => e.id === id);
 
-  if (index === -1) {
-    return res.status(404).json({ error: 'Entry not found' });
+    if (index === -1) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Ledger entry not found.' });
+    }
+
+    const updatedFields: RawLedgerInput = req.body;
+    const mergedInput: RawLedgerInput = {
+      ...rawRecords[index],
+      ...updatedFields,
+      id,
+    };
+
+    const valResult = validateLedgerInput(mergedInput);
+    if (!valResult.isValid) {
+      return res.status(400).json({
+        error: 'VALIDATION_FAILED',
+        message: 'Invalid updated fields provided.',
+        validationErrors: valResult.errors,
+      });
+    }
+
+    rawRecords[index] = mergedInput;
+    saveRawLedgerStore(rawRecords);
+
+    const recalculated = processAndRecalculateLedger(rawRecords);
+    res.json({ success: true, data: recalculated });
+  } catch (err) {
+    handleStoreError(res, err);
   }
-
-  const updatedData = req.body;
-  const itemCode = (updatedData.itemCode !== undefined ? updatedData.itemCode : rawEntries[index].itemCode).trim().toUpperCase();
-  const mappedName = ITEM_CODE_MAP[itemCode] || updatedData.itemName || rawEntries[index].itemName || '';
-  const qty = Number(updatedData.qty !== undefined ? updatedData.qty : rawEntries[index].qty) || 0;
-  const rate = Number(updatedData.rate !== undefined ? updatedData.rate : rawEntries[index].rate) || 0;
-  const wChg = Number(updatedData.wChg !== undefined ? updatedData.wChg : rawEntries[index].wChg) || 0;
-  const amount = (qty > 0 || rate > 0) ? (qty * rate) + wChg : (Number(updatedData.amount !== undefined ? updatedData.amount : rawEntries[index].amount) || 0);
-
-  rawEntries[index] = {
-    ...rawEntries[index],
-    ...updatedData,
-    id,
-    itemCode,
-    itemName: mappedName,
-    qty,
-    rate,
-    wChg,
-    amount,
-    payment: Number(updatedData.payment !== undefined ? updatedData.payment : rawEntries[index].payment) || 0,
-  };
-
-  writeEntries(rawEntries);
-  const processed = processAndRecalculateLedger(rawEntries);
-  res.json({ success: true, data: processed });
 });
 
+// DELETE /api/ledger/:id - Delete single entry
 app.delete('/api/ledger/:id', (req: Request, res: Response) => {
-  const { id } = req.params;
-  const rawEntries = readEntries();
-  const filtered = rawEntries.filter((e) => e.id !== id);
+  try {
+    const { id } = req.params;
+    const rawRecords = readRawLedgerStore();
+    const filtered = rawRecords.filter((e) => e.id !== id);
 
-  if (filtered.length === rawEntries.length) {
-    return res.status(404).json({ error: 'Entry not found' });
+    if (filtered.length === rawRecords.length) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Ledger entry not found.' });
+    }
+
+    saveRawLedgerStore(filtered);
+    const recalculated = processAndRecalculateLedger(filtered);
+    res.json({ success: true, data: recalculated });
+  } catch (err) {
+    handleStoreError(res, err);
   }
-
-  writeEntries(filtered);
-  const processed = processAndRecalculateLedger(filtered);
-  res.json({ success: true, data: processed });
 });
 
+// DELETE /api/ledger - Destructive Clear All with backup creation
 app.delete('/api/ledger', (req: Request, res: Response) => {
-  writeEntries([]);
-  res.json({ success: true, message: 'Ledger cleared', data: [] });
+  try {
+    saveRawLedgerStore([]);
+    res.json({ success: true, message: 'All ledger data cleared and backup preserved.', data: [] });
+  } catch (err) {
+    handleStoreError(res, err);
+  }
 });
 
-// Start Vite / Static handling
+// Start Vite / Production Static Server
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({

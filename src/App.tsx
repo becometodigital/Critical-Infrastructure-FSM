@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo } from 'react';
-import { LedgerRecord, ITEM_CODE_MAPPING } from './types/ledger';
+import { LedgerRecord } from './types/ledger';
 import { LedgerApi } from './utils/ledgerApi';
 import { EntryModal } from './components/EntryModal';
 import {
@@ -16,13 +16,19 @@ import {
   Tag,
   Scale,
   Trash,
+  AlertOctagon,
+  Layers,
 } from 'lucide-react';
 
 export function App() {
   const [records, setRecords] = useState<LedgerRecord[]>([]);
   const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Modal State
   const [isModalOpen, setIsModalOpen] = useState<boolean>(false);
   const [editingRecord, setEditingRecord] = useState<LedgerRecord | null>(null);
+  const [editingSlipGroup, setEditingSlipGroup] = useState<LedgerRecord[] | null>(null);
 
   // Search & Filter state
   const [dateFilter, setDateFilter] = useState<string>('');
@@ -31,11 +37,13 @@ export function App() {
 
   const loadLedgerData = async () => {
     setIsLoading(true);
+    setErrorMessage(null);
     try {
       const data = await LedgerApi.getLedger();
       setRecords(data);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Failed to load ledger data:', err);
+      setErrorMessage(err.message || 'Failed to communicate with local ledger database.');
     } finally {
       setIsLoading(false);
     }
@@ -45,35 +53,72 @@ export function App() {
     loadLedgerData();
   }, []);
 
-  const handleSaveEntries = async (entries: Partial<LedgerRecord>[]) => {
-    if (editingRecord && entries.length === 1) {
-      await LedgerApi.updateEntry(editingRecord.id, entries[0]);
-    } else {
-      await LedgerApi.addEntries(entries);
-    }
+  // Save Handlers
+  const handleSaveSingle = async (id: string, entry: Partial<LedgerRecord>) => {
+    await LedgerApi.updateEntry(id, entry);
     await loadLedgerData();
   };
 
-  const handleEdit = (record: LedgerRecord) => {
+  const handleSaveGroup = async (slipNo: string, entries: Partial<LedgerRecord>[]) => {
+    await LedgerApi.updateSlipGroup(slipNo, entries);
+    await loadLedgerData();
+  };
+
+  const handleSaveNew = async (entries: Partial<LedgerRecord>[]) => {
+    await LedgerApi.addEntries(entries);
+    await loadLedgerData();
+  };
+
+  // Edit Handlers
+  const handleEditSingle = (record: LedgerRecord) => {
+    setEditingSlipGroup(null);
     setEditingRecord(record);
     setIsModalOpen(true);
   };
 
-  const handleDelete = async (id: string) => {
-    if (window.confirm('Are you sure you want to delete this ledger entry?')) {
-      await LedgerApi.deleteEntry(id);
-      await loadLedgerData();
+  const handleEditSlipGroup = async (slipNo: string) => {
+    try {
+      const group = records.filter((r) => r.slipNo.toLowerCase() === slipNo.toLowerCase());
+      if (group.length > 0) {
+        setEditingRecord(null);
+        setEditingSlipGroup(group);
+        setIsModalOpen(true);
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Failed to fetch slip group for editing.');
+    }
+  };
+
+  // Delete Handlers
+  const handleDeleteSingle = async (id: string) => {
+    if (window.confirm('Are you sure you want to delete this specific ledger row?')) {
+      try {
+        await LedgerApi.deleteEntry(id);
+        await loadLedgerData();
+      } catch (err: any) {
+        setErrorMessage(err.message || 'Failed to delete ledger entry.');
+      }
     }
   };
 
   const handleClearAll = async () => {
-    if (window.confirm('Are you sure you want to delete ALL ledger records? This cannot be undone.')) {
-      await LedgerApi.clearLedger();
-      await loadLedgerData();
+    const confirmationText = window.prompt(
+      'DANGER: You are about to DELETE ALL LEDGER DATA.\n\nType "CLEAR ALL" in capital letters below to confirm:'
+    );
+
+    if (confirmationText === 'CLEAR ALL') {
+      try {
+        await LedgerApi.clearLedger();
+        await loadLedgerData();
+      } catch (err: any) {
+        setErrorMessage(err.message || 'Failed to clear ledger database.');
+      }
+    } else if (confirmationText !== null) {
+      alert('Confirmation text did not match "CLEAR ALL". Operation canceled.');
     }
   };
 
-  // Filter logic
+  // Filter logic (filters ONLY visible records; does NOT recalculate or modify underlying ledger balance)
   const filteredRecords = useMemo(() => {
     return records.filter((r) => {
       const matchDate = !dateFilter || r.date.includes(dateFilter);
@@ -87,10 +132,15 @@ export function App() {
     });
   }, [records, dateFilter, slipFilter, itemFilter]);
 
-  // Export functionality
+  // Dashboard summary metrics MUST use the COMPLETE dataset, NOT filtered rows
+  const totalAmount = useMemo(() => records.reduce((sum, r) => sum + (r.amount || 0), 0), [records]);
+  const totalPayments = useMemo(() => records.reduce((sum, r) => sum + (r.payment || 0), 0), [records]);
+  const currentRunningBalance = records.length > 0 ? records[records.length - 1].runningBalance : 0;
+
+  // RFC-4180 Compliant CSV Export
   const handleExportCSV = () => {
     if (records.length === 0) {
-      alert('No data to export.');
+      alert('No data in ledger to export.');
       return;
     }
 
@@ -110,48 +160,47 @@ export function App() {
       'RUNNING BALANCE',
     ];
 
+    const escapeCsvField = (val: any) => {
+      if (val === null || val === undefined) return '""';
+      const str = String(val);
+      return `"${str.replace(/"/g, '""')}"`;
+    };
+
     const rows = filteredRecords.map((r) => [
-      r.date || '',
-      `"${r.slipNo || ''}"`,
-      `"${r.itemCode || ''}"`,
-      `"${r.itemName || ''}"`,
-      r.qty || 0,
-      r.rate || 0,
-      r.wChg || 0,
-      r.amount || 0,
-      r.payment || 0,
-      `"${r.title || ''}"`,
-      r.paymentDate || '',
-      `"${r.remarks || ''}"`,
-      r.runningBalance || 0,
+      escapeCsvField(r.date),
+      escapeCsvField(r.slipNo),
+      escapeCsvField(r.itemCode),
+      escapeCsvField(r.itemName),
+      r.qty,
+      r.rate,
+      r.wChg,
+      r.amount,
+      r.payment,
+      escapeCsvField(r.title),
+      escapeCsvField(r.paymentDate),
+      escapeCsvField(r.remarks),
+      r.runningBalance,
     ]);
 
-    const csvContent =
-      'data:text/csv;charset=utf-8,' +
-      [headers.join(','), ...rows.map((e) => e.join(','))].join('\n');
+    const csvLines = [headers.join(','), ...rows.map((row) => row.join(','))];
+    const csvContent = 'data:text/csv;charset=utf-8,' + encodeURIComponent(csvLines.join('\n'));
 
-    const encodedUri = encodeURI(csvContent);
     const link = document.createElement('a');
-    link.setAttribute('href', encodedUri);
+    link.setAttribute('href', csvContent);
     link.setAttribute('download', `ledger_export_${new Date().toISOString().split('T')[0]}.csv`);
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
   };
 
-  // Summary Metrics
-  const totalAmount = useMemo(() => filteredRecords.reduce((sum, r) => sum + (r.amount || 0), 0), [filteredRecords]);
-  const totalPayments = useMemo(() => filteredRecords.reduce((sum, r) => sum + (r.payment || 0), 0), [filteredRecords]);
-  const latestBalance = filteredRecords.length > 0 ? filteredRecords[filteredRecords.length - 1].runningBalance : 0;
-
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-cyan-500 selection:text-black">
       
       {/* Top Header */}
-      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-30">
+      <header className="bg-slate-900 border-b border-slate-800 sticky top-0 z-30 shadow-md">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="p-2.5 bg-cyan-950/80 border border-cyan-800/60 rounded-xl text-cyan-400">
+            <div className="p-2.5 bg-cyan-950/80 border border-cyan-800/60 rounded-xl text-cyan-400 shadow-xs">
               <BookOpen className="w-6 h-6" />
             </div>
             <div>
@@ -159,7 +208,7 @@ export function App() {
                 Ledger Management System
               </h1>
               <p className="text-xs text-slate-400">
-                Exact balance tracking, multi-item slips & automated item mapping
+                Deterministic chronological running balance & item code mapping
               </p>
             </div>
           </div>
@@ -168,6 +217,7 @@ export function App() {
             <button
               onClick={() => {
                 setEditingRecord(null);
+                setEditingSlipGroup(null);
                 setIsModalOpen(true);
               }}
               className="flex-1 sm:flex-none flex items-center justify-center gap-2 px-4 py-2 bg-cyan-600 hover:bg-cyan-500 text-white text-sm font-semibold rounded-lg shadow-md transition"
@@ -177,7 +227,7 @@ export function App() {
             <button
               onClick={handleExportCSV}
               className="flex items-center justify-center gap-2 px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-medium rounded-lg border border-slate-700 transition"
-              title="Export complete ledger to CSV"
+              title="Export visible ledger records to CSV"
             >
               <Download className="w-4 h-4" /> Export CSV
             </button>
@@ -185,7 +235,7 @@ export function App() {
               <button
                 onClick={handleClearAll}
                 className="p-2 text-rose-400 hover:text-rose-300 bg-rose-950/30 hover:bg-rose-950/60 border border-rose-900/50 rounded-lg transition"
-                title="Clear all ledger data"
+                title="Clear all ledger records (Creates backup file)"
               >
                 <Trash className="w-4 h-4" />
               </button>
@@ -197,13 +247,30 @@ export function App() {
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6 space-y-6">
 
-        {/* Summary Dashboard Cards */}
+        {/* Global Error Banner */}
+        {errorMessage && (
+          <div className="p-4 bg-rose-950/90 border border-rose-800 rounded-xl text-rose-200 text-sm flex items-start gap-3 shadow-lg">
+            <AlertOctagon className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+            <div className="flex-1 space-y-1">
+              <div className="font-bold text-rose-300">Database or Calculation Error</div>
+              <div>{errorMessage}</div>
+            </div>
+            <button
+              onClick={() => setErrorMessage(null)}
+              className="text-xs text-rose-400 hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {/* Summary Dashboard Cards (Uses COMPLETE Ledger, Independent of Active Search/Filter) */}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
               <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Total Charges</div>
               <div className="text-xl font-bold font-mono text-cyan-400 mt-1">
-                {totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                {totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
             </div>
             <div className="p-3 bg-cyan-950/40 rounded-lg text-cyan-400 border border-cyan-900/50">
@@ -215,7 +282,7 @@ export function App() {
             <div>
               <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Total Payments</div>
               <div className="text-xl font-bold font-mono text-emerald-400 mt-1">
-                {totalPayments.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+                {totalPayments.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
             </div>
             <div className="p-3 bg-emerald-950/40 rounded-lg text-emerald-400 border border-emerald-900/50">
@@ -226,8 +293,8 @@ export function App() {
           <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-4 flex items-center justify-between">
             <div>
               <div className="text-xs font-semibold uppercase tracking-wider text-slate-400">Current Running Balance</div>
-              <div className={`text-xl font-bold font-mono mt-1 ${latestBalance >= 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
-                {latestBalance.toLocaleString('en-US', { minimumFractionDigits: 2 })}
+              <div className={`text-xl font-bold font-mono mt-1 ${currentRunningBalance >= 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
+                {currentRunningBalance.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </div>
             </div>
             <div className="p-3 bg-amber-950/40 rounded-lg text-amber-400 border border-amber-900/50">
@@ -240,7 +307,7 @@ export function App() {
         <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-4 space-y-3">
           <div className="flex items-center justify-between text-xs font-semibold text-slate-400 uppercase tracking-wider">
             <span className="flex items-center gap-1.5 text-cyan-400">
-              <Filter className="w-4 h-4" /> Search & Filter Ledger
+              <Filter className="w-4 h-4" /> Search & Filter Visible Ledger
             </span>
             {(dateFilter || slipFilter || itemFilter) && (
               <button
@@ -288,7 +355,7 @@ export function App() {
                 type="text"
                 value={itemFilter}
                 onChange={(e) => setItemFilter(e.target.value)}
-                placeholder="Filter by Item / Code..."
+                placeholder="Filter by Item Code or Name..."
                 className="w-full bg-slate-950 border border-slate-700/80 rounded-lg pl-9 pr-3 py-2 text-sm text-slate-200 focus:outline-hidden focus:border-cyan-500"
               />
             </div>
@@ -328,83 +395,102 @@ export function App() {
                     <td colSpan={13} className="px-6 py-16 text-center text-slate-500 font-sans">
                       <div className="flex flex-col items-center justify-center space-y-2">
                         <BookOpen className="w-8 h-8 text-slate-600" />
-                        <div className="text-sm font-medium text-slate-400">No ledger records found</div>
+                        <div className="text-sm font-medium text-slate-400">No records found</div>
                         <div className="text-xs text-slate-500">
                           {records.length === 0
-                            ? 'The ledger is currently empty. Click "Add Ledger Entry" to create new records.'
-                            : 'No records match your search filters.'}
+                            ? 'The ledger is currently empty.'
+                            : 'No records match your active search filters.'}
                         </div>
                       </div>
                     </td>
                   </tr>
                 ) : (
-                  filteredRecords.map((r) => (
-                    <tr key={r.id} className="hover:bg-slate-800/40 transition">
-                      <td className="px-3 py-2.5 whitespace-nowrap text-slate-400 text-center font-sans">
-                        {r.date}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap font-semibold text-slate-200">
-                        {r.slipNo || '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap font-sans">
-                        <span className="font-semibold text-slate-100">{r.itemName || r.itemCode || '-'}</span>
-                        {r.itemCode && (
-                          <span className="ml-1.5 text-[10px] text-cyan-400 bg-cyan-950/80 px-1.5 py-0.5 rounded-sm border border-cyan-800/60 font-mono">
-                            {r.itemCode}
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-right">
-                        {r.qty ? r.qty : '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-right">
-                        {r.rate ? r.rate.toFixed(2) : '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-right text-slate-400">
-                        {r.wChg ? r.wChg.toFixed(2) : '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-right font-semibold text-cyan-400">
-                        {r.amount ? r.amount.toFixed(2) : '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-right font-semibold text-emerald-400">
-                        {r.payment ? r.payment.toFixed(2) : '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap font-sans text-slate-300">
-                        {r.title || '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-center font-sans text-slate-400">
-                        {r.paymentDate || '-'}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap font-sans text-slate-400 max-w-xs truncate">
-                        {r.remarks || '-'}
-                      </td>
-                      <td
-                        className={`px-3 py-2.5 whitespace-nowrap text-right font-bold ${
-                          r.runningBalance >= 0 ? 'text-amber-400' : 'text-emerald-400'
-                        }`}
-                      >
-                        {r.runningBalance.toFixed(2)}
-                      </td>
-                      <td className="px-3 py-2.5 whitespace-nowrap text-center">
-                        <div className="flex items-center justify-center gap-1">
-                          <button
-                            onClick={() => handleEdit(r)}
-                            className="p-1 text-slate-400 hover:text-cyan-400 hover:bg-slate-800 rounded-sm transition"
-                            title="Edit entry"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => handleDelete(r.id)}
-                            className="p-1 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-sm transition"
-                            title="Delete entry"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  ))
+                  filteredRecords.map((r) => {
+                    const slipCount = r.slipNo ? records.filter((rec) => rec.slipNo.toLowerCase() === r.slipNo.toLowerCase()).length : 1;
+
+                    return (
+                      <tr key={r.id} className="hover:bg-slate-800/40 transition">
+                        <td className="px-3 py-2.5 whitespace-nowrap text-slate-400 text-center font-sans">
+                          {r.date}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap font-semibold text-slate-200">
+                          {r.slipNo || '-'}
+                          {slipCount > 1 && (
+                            <span className="ml-1 text-[10px] text-slate-400 bg-slate-800 px-1 py-0.5 rounded-sm font-sans" title={`${slipCount} items in slip`}>
+                              ({slipCount})
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap font-sans">
+                          <span className="font-semibold text-slate-100">{r.itemName || r.itemCode || '-'}</span>
+                          {r.itemCode && (
+                            <span className="ml-1.5 text-[10px] text-cyan-400 bg-cyan-950/80 px-1.5 py-0.5 rounded-sm border border-cyan-800/60 font-mono">
+                              {r.itemCode}
+                            </span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-right">
+                          {r.qty ? r.qty : '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-right">
+                          {r.rate ? r.rate.toFixed(2) : '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-right text-slate-400">
+                          {r.wChg ? r.wChg.toFixed(2) : '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-right font-semibold text-cyan-400">
+                          {r.amount ? r.amount.toFixed(2) : '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-right font-semibold text-emerald-400">
+                          {r.payment ? r.payment.toFixed(2) : '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap font-sans text-slate-300">
+                          {r.title || '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-center font-sans text-slate-400">
+                          {r.paymentDate || '-'}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap font-sans text-slate-400 max-w-xs truncate">
+                          {r.remarks || '-'}
+                        </td>
+                        <td
+                          className={`px-3 py-2.5 whitespace-nowrap text-right font-bold ${
+                            r.runningBalance >= 0 ? 'text-amber-400' : 'text-emerald-400'
+                          }`}
+                        >
+                          {r.runningBalance.toFixed(2)}
+                        </td>
+                        <td className="px-3 py-2.5 whitespace-nowrap text-center">
+                          <div className="flex items-center justify-center gap-1">
+                            {slipCount > 1 ? (
+                              <button
+                                onClick={() => handleEditSlipGroup(r.slipNo)}
+                                className="p-1 text-cyan-400 hover:text-cyan-300 hover:bg-slate-800 rounded-sm transition flex items-center gap-0.5"
+                                title="Edit complete slip group"
+                              >
+                                <Layers className="w-3.5 h-3.5" />
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => handleEditSingle(r)}
+                                className="p-1 text-slate-400 hover:text-cyan-400 hover:bg-slate-800 rounded-sm transition"
+                                title="Edit single entry"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                            )}
+                            <button
+                              onClick={() => handleDeleteSingle(r.id)}
+                              className="p-1 text-slate-400 hover:text-rose-400 hover:bg-slate-800 rounded-sm transition"
+                              title="Delete entry row"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
                 )}
               </tbody>
             </table>
@@ -419,9 +505,13 @@ export function App() {
         onClose={() => {
           setIsModalOpen(false);
           setEditingRecord(null);
+          setEditingSlipGroup(null);
         }}
-        onSave={handleSaveEntries}
+        onSaveSingle={handleSaveSingle}
+        onSaveGroup={handleSaveGroup}
+        onSaveNew={handleSaveNew}
         editingRecord={editingRecord}
+        editingSlipGroup={editingSlipGroup}
       />
 
     </div>
